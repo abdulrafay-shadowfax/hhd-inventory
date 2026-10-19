@@ -1,4 +1,4 @@
-// HHD Inventory backend v3.3 (v3.2 + changeStatusBulk + imei_number): Supabase (PostgreSQL). Columns are CapitalCase (Serial, TicketID, ...).
+// HHD Inventory backend v3.4 (v3.3 + auditComplete / audits table / LastAudited): Supabase (PostgreSQL). Columns are CapitalCase (Serial, TicketID, ...).
 // Secret key lives in Script Properties (Project Settings > Script properties > SUPABASE_KEY), never in code.
 // v3.2: Parallel batch requests for 10x speedup on dispatch/ack operations
 
@@ -200,6 +200,50 @@ const ACTIONS = {
     return { count: todo.length };
   },
 
+  // HHD audit: scans are classified client-side; this re-derives each result from the DB, applies it, saves the audit.
+  auditComplete(p, u) {
+    const site = String(p.site || '').trim();
+    need_(site, 'Location required');
+    need_(siteOk_(u, site), 'Forbidden: no access to ' + site);
+    const scanned = [...new Set((p.serials || []).map(s => String(s).trim().toUpperCase()).filter(Boolean))];
+    need_(scanned.length, 'Nothing scanned');
+    const inList = ss => '?Serial=in.' + encodeURIComponent('(' + ss.map(s => '"' + s + '"').join(',') + ')');
+    const chunk = a => { const o = []; for (let i = 0; i < a.length; i += 150) o.push(a.slice(i, i + 150)); return o; };
+    const devs = [].concat(...chunk(scanned).map(c => api_('devices', 'GET', null, inList(c))));
+    const by = Object.fromEntries(devs.map(d => [d.Serial, d]));
+
+    // validate everything first: all-or-nothing
+    const items = scanned.map(s => {
+      const d = by[s];
+      need_(!d || d.Status !== 'In-Transit', s + ' is in transit; acknowledge its ticket first');
+      return {
+        Serial: s, Make: d ? d.Make : 'Unknown', Model: d ? d.Model : 'Unknown', Status: d ? d.Status : 'Working',
+        From: d && d.Location !== site ? d.Location : '',
+        Type: !d ? 'New' : d.Location === site ? 'Reconciled' : 'Transferred',
+      };
+    });
+    const of = t => items.filter(i => i.Type === t);
+    const now = now_();
+    const H = { apikey: SUPABASE_KEY, Authorization: 'Bearer ' + SUPABASE_KEY, 'Content-Type': 'application/json', Prefer: 'return=representation' }; // apiBatch_ JSON-parses every reply, so a body is required
+    const patch = (ss, body) => chunk(ss).map(c => ({ url: SUPABASE_URL + '/rest/v1/devices' + inList(c), method: 'PATCH', headers: H, payload: JSON.stringify(body) }));
+
+    if (of('New').length) api_('devices', 'POST', of('New').map(i => ({ Serial: i.Serial, Make: 'Unknown', Model: 'Unknown', Status: 'Working', Location: site, LastUpdated: now, LastAudited: now })));
+    apiBatch_([
+      ...patch(of('Reconciled').map(i => i.Serial), { LastAudited: now }),
+      ...patch(of('Transferred').map(i => i.Serial), { Location: site, LastUpdated: now, LastAudited: now }),
+    ]);
+
+    // missing = registered at this site (in-transit devices have a different Location string) but not scanned
+    const seen = new Set(scanned);
+    const missing = api_('devices', 'GET', null, '?select=Serial,Make,Model,Status&Location=eq.' + encodeURIComponent(site)).filter(d => !seen.has(d.Serial));
+    const auditor = u.name + ' (' + u.user + ')', id = 'AUD-' + Utilities.getUuid().slice(0, 8).toUpperCase();
+    api_('audits', 'POST', {
+      AuditID: id, Location: site, Auditor: auditor, CompletedAt: now, Items: items,
+      Summary: { total: items.length, reconciled: of('Reconciled').length, excess: of('New').length, transferred: of('Transferred').length, missing: missing.length },
+    });
+    return { auditId: id, site, auditor, at: now, items, missing };
+  },
+
   importDevices(p, u) {
     admin_(u);
     const items = p.devices || [];
@@ -266,7 +310,7 @@ function doGet(e) {
     const u = verify_(e.parameter.token);
     if (!u) return out_({ ok: false, error: 'auth' });
     return out_({
-      ok: true, version: '3.3', devices: api_('devices'), tickets: api_('tickets'),
+      ok: true, version: '3.4', devices: api_('devices'), tickets: api_('tickets'),
       users: users_(), sites: api_('sites').map(x => x.Site),
       // admins see every change, others only changes at sites they can access
       statusLog: api_('status_log', 'GET', null, '?order=ChangedAt.desc&limit=1000').filter(l => siteOk_(u, l.Location)),

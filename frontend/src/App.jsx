@@ -2,7 +2,7 @@ import { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import {
   LayoutDashboard, Inbox, ScanLine, Boxes, ClipboardList, Settings, RefreshCw, ShieldCheck,
   X, Search, Truck, CheckCircle2, AlertTriangle, User, MapPin, Trash2, Send, LogOut, Lock, Upload,
-  ChevronLeft, ChevronRight, ArrowUp, ArrowDown, ArrowUpDown, History,
+  ChevronLeft, ChevronRight, ArrowUp, ArrowDown, ArrowUpDown, History, ClipboardCheck, FileDown,
 } from 'lucide-react';
 
 // @csv-start (pure helpers; tested by csv.test.mjs)
@@ -58,7 +58,7 @@ function toDevices(rows, existing = []) {
 // @csv-end
 
 // Backend URL: baked in at build time (Vercel env var VITE_API_URL). Admins may override it in the Config tab.
-const DEFAULT_URL = 'https://script.google.com/macros/s/AKfycbwSUJT6TrctslVD6p1aixL_O_QXMOcDwuj_hMAKwBXQlDC10wRurKUoaO4-4sM5U6fD/exec';
+const DEFAULT_URL = 'https://script.google.com/macros/s/AKfycbxsNjVBcrYzUos1XRlIUiwpSBKoFkScE1TRCdGZWkgmp6hPDHVRds2wR1tAWaRgTkO7/exec';
 const ACTIONS = ['Inter-Site Transfer', 'Handover to Service Support', 'Replacement Return from Service Support'];
 const BADGE = {
   Working: 'bg-green-100 text-green-800',
@@ -78,6 +78,7 @@ const TABS = [
   ['master', 'Master Inventory', Boxes],
   ['audit', 'Ticket Audit Trail', ClipboardList],
   ['log', 'Status Log', History],
+  ['hhdaudit', 'HHD Audit', ClipboardCheck],
 ];
 const ADMIN_TABS = [['config', 'Config', Settings], ['admin', 'Admin', ShieldCheck]];
 
@@ -418,6 +419,7 @@ function Main({ url, setUrl, auth, logout }) {
         {tab === 'master' && <DeviceTable devices={data.devices} me={auth} push={push} busy={busy} flash={flash} />}
         {tab === 'audit' && <Audit tickets={data.tickets} devices={data.devices} />}
         {tab === 'log' && <StatusLog log={data.statusLog} devices={data.devices} />}
+        {tab === 'hhdaudit' && <DeviceAudit sites={own} devices={data.devices} push={push} busy={busy} />}
         {tab === 'config' && admin && <Config url={url} setUrl={setUrl} load={load} data={data} me={auth} flash={flash} />}
         {tab === 'admin' && admin && <Admin data={data} sites={allSites} push={push} busy={busy} flash={flash} />}
       </main>
@@ -918,5 +920,164 @@ function UserAdmin({ users, push, busy, flash }) {
         <Btn type="submit" disabled={busy || !u.username || !u.name || !u.site}>Save user</Btn>
       </form>
     </Card>
+  );
+}
+
+/* ---------- HHD Audit ---------- */
+const TYPE_BADGE = { Reconciled: 'bg-green-100 text-green-800', New: 'bg-blue-100 text-blue-800', Transferred: 'bg-red-100 text-red-800', Missing: 'bg-gray-200 text-gray-800' };
+
+// PDF is built in the browser; libs are loaded on demand so they don't bloat the main bundle.
+async function makePdf({ site, auditor, at, items, missing }) {
+  const [{ jsPDF }, { default: autoTable }] = await Promise.all([import('jspdf'), import('jspdf-autotable')]);
+  const doc = new jsPDF(), n = (t) => items.filter((i) => i.Type === t).length;
+  doc.setFontSize(16); doc.text('HHD Device Audit Report', 14, 16);
+  doc.setFontSize(10);
+  doc.text([
+    `Location: ${site}`, `IT Personnel: ${auditor}`, `Date/Time: ${new Date(at).toLocaleString()}`,
+    `Total scanned: ${items.length}   Reconciled: ${n('Reconciled')}   Excess/New: ${n('New')}   Transferred: ${n('Transferred')}   Missing: ${missing.length}`,
+  ], 14, 24);
+  autoTable(doc, {
+    startY: 46, head: [['#', 'Serial', 'Make', 'Model', 'Result', 'Previous location']],
+    body: [...items.map((i) => [i.Type, i]), ...missing.map((m) => ['Missing', m])].map(([t, d], k) => [k + 1, d.Serial, d.Make, d.Model, t, d.From || '']),
+  });
+  doc.save(`HHD-Audit-${site}-${String(at).slice(0, 10)}.pdf`);
+}
+
+function AuditSummary({ items, missing }) {
+  const n = (t) => items.filter((i) => i.Type === t).length;
+  const all = [...items, ...missing.map((m) => ({ ...m, Type: 'Missing' }))];
+  return (
+    <>
+      <div className="grid grid-cols-2 md:grid-cols-5 gap-3 mb-4">
+        {[['Total scanned', items.length], ['Reconciled', n('Reconciled')], ['Excess / New', n('New')], ['Transferred', n('Transferred')], ['Missing', missing.length]].map(([k, v]) => (
+          <Card key={k} className="p-3"><div className="text-xs text-slate-500">{k}</div><div className="text-2xl font-bold">{v}</div></Card>
+        ))}
+      </div>
+      <table className="w-full text-sm">
+        <thead className="text-left text-xs uppercase text-slate-500"><tr><th className="p-2">Serial</th><th className="p-2">Make / Model</th><th className="p-2">Result</th><th className="p-2">Previous location</th></tr></thead>
+        <tbody>
+          {all.map((r) => (
+            <tr key={r.Serial} className="border-t">
+              <td className="p-2 font-mono">{r.Serial}</td><td className="p-2">{r.Make} {r.Model}</td>
+              <td className="p-2"><span className={`px-2 py-0.5 rounded-full text-xs font-medium ${TYPE_BADGE[r.Type]}`}>{r.Type}</span></td>
+              <td className="p-2">{r.From}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </>
+  );
+}
+
+function DeviceAudit({ sites, devices, push, busy }) {
+  const [loc, setLoc] = useState('');
+  const [scan, setScan] = useState('');
+  const [rows, setRows] = useState([]);   // accepted scans: {Serial, Type, From, Make, Model}
+  const [warn, setWarn] = useState(null); // device registered elsewhere, awaiting confirm
+  const [note, setNote] = useState('');
+  const [review, setReview] = useState(false);
+  const [done, setDone] = useState(null);
+  const inp = useRef(null);
+  const byS = useMemo(() => Object.fromEntries(devices.map((d) => [d.Serial, d])), [devices]);
+  const byImei = useMemo(() => {
+    const m = {};
+    devices.forEach((d) => { const k = String(d.imei_number || '').trim().toUpperCase(); if (k) (m[k] ||= []).push(d); });
+    return m;
+  }, [devices]);
+  const focus = () => setTimeout(() => inp.current?.focus(), 0);
+  useEffect(() => { setRows([]); setNote(''); if (loc) focus(); }, [loc]);
+
+  const add = () => {
+    const s = scan.trim().toUpperCase();
+    setScan(''); setNote(''); focus();
+    if (!s) return;
+    // a serial match always wins over an IMEI match
+    const hits = byS[s] ? [byS[s]] : byImei[s] || [];
+    const free = hits.filter((x) => !rows.some((r) => r.Serial === x.Serial));
+    if (hits.length ? !free.length : rows.some((r) => r.Serial === s)) return setNote(`${s}: already scanned`);
+    if (!hits.length) return setRows((r) => [{ Serial: s, Type: 'New', Make: 'Unknown', Model: 'Unknown' }, ...r]);
+    // ponytail: a shared IMEI takes the first unscanned device at this location; elsewhere only if unambiguous
+    const d = free.find((x) => x.Location === loc) || (free.length === 1 ? free[0] : null);
+    if (!d) return setNote(`${s}: IMEI shared by ${free.length} devices at other locations, scan the serial instead`);
+    if (inTransit(d)) return setNote(`${d.Serial}: in transit, acknowledge its ticket first`);
+    if (d.Location !== loc) return setWarn(d);
+    setRows((r) => [{ Serial: d.Serial, imei: d.imei_number, Type: 'Reconciled', Make: d.Make, Model: d.Model }, ...r]);
+  };
+  const reassign = () => {
+    setRows((r) => [{ Serial: warn.Serial, imei: warn.imei_number, Type: 'Transferred', From: warn.Location, Make: warn.Make, Model: warn.Model }, ...r]);
+    setWarn(null); focus();
+  };
+  const cancel = () => { setWarn(null); focus(); };
+
+  const missing = useMemo(() => {
+    const seen = new Set(rows.map((r) => r.Serial));
+    return devices.filter((d) => d.Location === loc && !seen.has(d.Serial));
+  }, [devices, loc, rows]);
+
+  // Nothing is written until here. The server re-derives each result and saves the audit.
+  const commit = async () => {
+    const j = await push('auditComplete', { site: loc, serials: rows.map((r) => r.Serial) });
+    if (j) { setReview(false); setRows([]); setDone(j); makePdf(j); }
+  };
+
+  return (
+    <div className="space-y-4">
+      <Card className="p-4 space-y-3">
+        <h2 className="font-semibold">HHD Device Audit</h2>
+        <Select value={loc} onChange={(e) => setLoc(e.target.value)} className="w-full">
+          <option value="">Select audit location…</option>{sites.map((s) => <option key={s}>{s}</option>)}
+        </Select>
+        <div className="flex gap-2">
+          <input ref={inp} disabled={!loc || !!warn} value={scan} onChange={(e) => setScan(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && add()}
+            placeholder={loc ? 'Scan serial or IMEI, press Enter' : 'Pick a location first'}
+            className="border border-slate-300 rounded-lg px-3 py-2 text-sm w-full focus:outline-none focus:ring-2 focus:ring-indigo-400 disabled:bg-slate-100" />
+          <Btn onClick={add} disabled={!loc || !scan.trim()}>Add</Btn>
+        </div>
+        {note && <div className="text-sm text-red-700 bg-red-50 rounded-lg p-2 flex gap-2"><AlertTriangle size={16} className="shrink-0 mt-0.5" />{note}</div>}
+      </Card>
+
+      <Card className="p-4 space-y-3">
+        <div className="flex justify-between items-center">
+          <h2 className="font-semibold">Scanned ({rows.length})</h2>
+          <Btn disabled={!rows.length || busy} onClick={() => setReview(true)}><CheckCircle2 size={16} /> Complete Audit</Btn>
+        </div>
+        <div className="max-h-96 overflow-auto divide-y">
+          {rows.map((r) => (
+            <div key={r.Serial} className={`py-2 px-1 text-sm flex justify-between ${r.Type === 'Transferred' ? 'bg-red-50' : ''}`}>
+              <span><span className="font-mono">{r.Serial}</span> <span className="text-slate-500">{r.Make} {r.Model}{r.imei && ` · IMEI ${r.imei}`}{r.From && ` · from ${r.From}`}</span></span>
+              <span className={`px-2 py-0.5 rounded-full text-xs font-medium ${TYPE_BADGE[r.Type]}`}>{r.Type}</span>
+            </div>
+          ))}
+          {!rows.length && <div className="py-8 text-center text-slate-400">Nothing scanned yet.</div>}
+        </div>
+      </Card>
+
+      {warn && (
+        <Modal title="Location mismatch" onClose={cancel}>
+          <div className="bg-red-50 border border-red-300 text-red-800 rounded-lg p-4 flex gap-2">
+            <AlertTriangle size={18} className="shrink-0" />
+            <span><b className="font-mono">{warn.Serial}</b>: This device belongs to <b>{warn.Location}</b>. Do you want to reassign it here?</span>
+          </div>
+          <div className="mt-4 flex gap-3">
+            <Btn onClick={reassign} className="!bg-red-600 hover:!bg-red-700">Confirm</Btn>
+            <Btn onClick={cancel} className="!bg-slate-500 hover:!bg-slate-600">Cancel</Btn>
+          </div>
+        </Modal>
+      )}
+
+      {review && (
+        <Modal title={`Audit summary — ${loc}`} onClose={() => setReview(false)}>
+          <AuditSummary items={rows} missing={missing} />
+          <div className="mt-4"><Btn onClick={commit} disabled={busy}><FileDown size={16} /> Confirm, Save & Download PDF</Btn></div>
+        </Modal>
+      )}
+
+      {done && (
+        <Modal title={`Audit ${done.auditId} saved — ${done.site}`} onClose={() => setDone(null)}>
+          <AuditSummary items={done.items} missing={done.missing} />
+          <div className="mt-4"><Btn onClick={() => makePdf(done)}><FileDown size={16} /> Download PDF again</Btn></div>
+        </Modal>
+      )}
+    </div>
   );
 }
