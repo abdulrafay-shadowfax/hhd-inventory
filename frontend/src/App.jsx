@@ -2,7 +2,7 @@ import { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import {
   LayoutDashboard, Inbox, ScanLine, Boxes, ClipboardList, Settings, RefreshCw, ShieldCheck,
   X, Search, Truck, CheckCircle2, AlertTriangle, User, MapPin, Trash2, Send, LogOut, Lock, Upload,
-  ChevronLeft, ChevronRight, ArrowUp, ArrowDown, ArrowUpDown, History, ClipboardCheck, FileDown,
+  ChevronLeft, ChevronRight, ArrowUp, ArrowDown, ArrowUpDown, History, ClipboardCheck, FileDown, ScrollText,
 } from 'lucide-react';
 
 // @csv-start (pure helpers; tested by csv.test.mjs)
@@ -58,7 +58,7 @@ function toDevices(rows, existing = []) {
 // @csv-end
 
 // Backend URL: baked in at build time (Vercel env var VITE_API_URL). Admins may override it in the Config tab.
-const DEFAULT_URL = 'https://script.google.com/macros/s/AKfycbxsNjVBcrYzUos1XRlIUiwpSBKoFkScE1TRCdGZWkgmp6hPDHVRds2wR1tAWaRgTkO7/exec';
+const DEFAULT_URL = 'https://script.google.com/macros/s/AKfycbzeqc5TBgEAiBVWxIeSc81Oi60APZ0KaF7KMSGmbbVMerU08a2BWASAvw0lZqia71Ph/exec';
 const ACTIONS = ['Inter-Site Transfer', 'Handover to Service Support', 'Replacement Return from Service Support'];
 const BADGE = {
   Working: 'bg-green-100 text-green-800',
@@ -79,6 +79,7 @@ const TABS = [
   ['audit', 'Ticket Audit Trail', ClipboardList],
   ['log', 'Status Log', History],
   ['hhdaudit', 'HHD Audit', ClipboardCheck],
+  ['auditlog', 'Audit Log', ScrollText],
 ];
 const ADMIN_TABS = [['config', 'Config', Settings], ['admin', 'Admin', ShieldCheck]];
 
@@ -338,6 +339,8 @@ function Main({ url, setUrl, auth, logout }) {
   const [data, setData] = useState({ devices: [], tickets: [], users: [], sites: [], statusLog: [] });
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState(null);
+  const [exportSites, setExportSites] = useState([]); // master-list CSV: sites to include
+  useEffect(() => setExportSites(site ? [site] : []), [site]);
   const admin = auth.role === 'admin';
 
   const flash = useCallback((type, text) => { setMsg({ type, text }); setTimeout(() => setMsg(null), 6000); }, []);
@@ -416,10 +419,20 @@ function Main({ url, setUrl, auth, logout }) {
         {tab === 'dash' && <Dashboard devices={data.devices} />}
         {tab === 'pending' && <Pending list={incoming} site={site} me={auth} push={push} busy={busy} flash={flash} />}
         {tab === 'dispatch' && <Dispatch site={site} sites={allSites} me={auth} users={data.users} devices={data.devices} push={push} busy={busy} flash={flash} />}
-        {tab === 'master' && <DeviceTable devices={data.devices} me={auth} push={push} busy={busy} flash={flash} />}
+        {tab === 'master' && (
+          <div className="space-y-3">
+            <Card className="p-3 flex flex-wrap gap-3 items-center">
+              <MultiSelect label="sites" options={own} value={exportSites} onChange={setExportSites} />
+              {admin && <button className="text-sm text-indigo-600 hover:underline" onClick={() => setExportSites(own)}>All sites</button>}
+              <Btn onClick={() => saveMaster(data.devices, data.tickets, exportSites)} disabled={!exportSites.length}><FileDown size={16} /> Download master list (CSV)</Btn>
+            </Card>
+            <DeviceTable devices={data.devices} me={auth} push={push} busy={busy} flash={flash} />
+          </div>
+        )}
         {tab === 'audit' && <Audit tickets={data.tickets} devices={data.devices} />}
         {tab === 'log' && <StatusLog log={data.statusLog} devices={data.devices} />}
         {tab === 'hhdaudit' && <DeviceAudit sites={own} devices={data.devices} push={push} busy={busy} />}
+        {tab === 'auditlog' && <AuditLog audits={data.audits || []} />}
         {tab === 'config' && admin && <Config url={url} setUrl={setUrl} load={load} data={data} me={auth} flash={flash} />}
         {tab === 'admin' && admin && <Admin data={data} sites={allSites} push={push} busy={busy} flash={flash} />}
       </main>
@@ -926,24 +939,49 @@ function UserAdmin({ users, push, busy, flash }) {
 /* ---------- HHD Audit ---------- */
 const TYPE_BADGE = { Reconciled: 'bg-green-100 text-green-800', New: 'bg-blue-100 text-blue-800', Transferred: 'bg-red-100 text-red-800', Missing: 'bg-gray-200 text-gray-800' };
 
-// PDF is built in the browser; libs are loaded on demand so they don't bloat the main bundle.
-async function makePdf({ site, auditor, at, items, missing }) {
+// last physical scan; falls back to last status change for devices never audited
+const lastSeen = (d) => d.LastAudited || d.LastUpdated || '';
+const ageDays = (d, at = Date.now()) => (lastSeen(d) ? Math.floor((new Date(at) - new Date(lastSeen(d))) / 864e5) : '');
+
+// one row per device; the PDF and the CSV both come from here
+function auditRows({ items, missing, at }) {
+  return [
+    ...items.map((i) => ({ Result: i.Type, Serial: i.Serial, IMEI: i.imei || '', Make: i.Make, Model: i.Model, Previous: i.From || '', LastScanned: at, Age: 0 })),
+    ...missing.map((m) => ({ Result: 'Missing', Serial: m.Serial, IMEI: m.imei_number || '', Make: m.Make, Model: m.Model, Previous: '', LastScanned: lastSeen(m), Age: ageDays(m, at) })),
+  ];
+}
+const COLS = ['#', 'Result', 'Serial', 'IMEI', 'Make', 'Model', 'Previous location', 'Last scanned', 'Age (days)'];
+const cells = (r, k) => [k + 1, r.Result, r.Serial, r.IMEI, r.Make, r.Model, r.Previous, r.LastScanned ? fmt(r.LastScanned) : '', r.Age];
+
+async function makePdf(j) {
+  const { site, auditor, at, items, missing } = j;
   const [{ jsPDF }, { default: autoTable }] = await Promise.all([import('jspdf'), import('jspdf-autotable')]);
-  const doc = new jsPDF(), n = (t) => items.filter((i) => i.Type === t).length;
+  const n = (t) => items.filter((i) => i.Type === t).length;
+  const doc = new jsPDF({ orientation: 'landscape' });
   doc.setFontSize(16); doc.text('HHD Device Audit Report', 14, 16);
   doc.setFontSize(10);
   doc.text([
-    `Location: ${site}`, `IT Personnel: ${auditor}`, `Date/Time: ${new Date(at).toLocaleString()}`,
+    `Location: ${site}`, `IT Personnel: ${auditor}`, `Date/Time: ${fmt(at)}`,
     `Total scanned: ${items.length}   Reconciled: ${n('Reconciled')}   Excess/New: ${n('New')}   Transferred: ${n('Transferred')}   Missing: ${missing.length}`,
   ], 14, 24);
-  autoTable(doc, {
-    startY: 46, head: [['#', 'Serial', 'Make', 'Model', 'Result', 'Previous location']],
-    body: [...items.map((i) => [i.Type, i]), ...missing.map((m) => ['Missing', m])].map(([t, d], k) => [k + 1, d.Serial, d.Make, d.Model, t, d.From || '']),
-  });
+  autoTable(doc, { startY: 46, head: [COLS], body: auditRows(j).map(cells) });
   doc.save(`HHD-Audit-${site}-${String(at).slice(0, 10)}.pdf`);
 }
 
-function AuditSummary({ items, missing }) {
+function downloadCsv(j) {
+  const q = (v) => `"${String(v ?? '').replace(/"/g, '""')}"`;
+  // CSV only: current location goes right after "Previous location" (index 7 after the Result/Serial/... columns)
+  const head = [...COLS]; head.splice(7, 0, 'Current location');
+  const rows = auditRows(j).map((r, k) => { const c = cells(r, k); c.splice(7, 0, j.site); return c; });
+  const text = [head, ...rows].map((row) => row.map(q).join(',')).join('\r\n');
+  const url = URL.createObjectURL(new Blob(['﻿' + text], { type: 'text/csv;charset=utf-8' })); // BOM so Excel reads UTF-8
+  const a = document.createElement('a');
+  a.href = url; a.download = `HHD-Audit-${j.site}-${String(j.at).slice(0, 10)}.csv`;
+  a.click(); URL.revokeObjectURL(url);
+}
+const exportAudit = (j) => { makePdf(j); downloadCsv(j); };
+
+function AuditSummary({ items, missing, at }) {
   const n = (t) => items.filter((i) => i.Type === t).length;
   const all = [...items, ...missing.map((m) => ({ ...m, Type: 'Missing' }))];
   return (
@@ -954,13 +992,15 @@ function AuditSummary({ items, missing }) {
         ))}
       </div>
       <table className="w-full text-sm">
-        <thead className="text-left text-xs uppercase text-slate-500"><tr><th className="p-2">Serial</th><th className="p-2">Make / Model</th><th className="p-2">Result</th><th className="p-2">Previous location</th></tr></thead>
+        <thead className="text-left text-xs uppercase text-slate-500"><tr><th className="p-2">Serial</th><th className="p-2">Make / Model</th><th className="p-2">Result</th><th className="p-2">Previous location</th><th className="p-2">Last scanned</th><th className="p-2">Age (days)</th></tr></thead>
         <tbody>
           {all.map((r) => (
             <tr key={r.Serial} className="border-t">
               <td className="p-2 font-mono">{r.Serial}</td><td className="p-2">{r.Make} {r.Model}</td>
               <td className="p-2"><span className={`px-2 py-0.5 rounded-full text-xs font-medium ${TYPE_BADGE[r.Type]}`}>{r.Type}</span></td>
               <td className="p-2">{r.From}</td>
+              <td className="p-2">{r.Type === 'Missing' ? fmt(lastSeen(r)) : ''}</td>
+              <td className="p-2">{r.Type === 'Missing' ? ageDays(r, at) : ''}</td>
             </tr>
           ))}
         </tbody>
@@ -1017,7 +1057,7 @@ function DeviceAudit({ sites, devices, push, busy }) {
   // Nothing is written until here. The server re-derives each result and saves the audit.
   const commit = async () => {
     const j = await push('auditComplete', { site: loc, serials: rows.map((r) => r.Serial) });
-    if (j) { setReview(false); setRows([]); setDone(j); makePdf(j); }
+    if (j) { setReview(false); setRows([]); setDone(j); exportAudit(j); }
   };
 
   return (
@@ -1068,16 +1108,100 @@ function DeviceAudit({ sites, devices, push, busy }) {
       {review && (
         <Modal title={`Audit summary — ${loc}`} onClose={() => setReview(false)}>
           <AuditSummary items={rows} missing={missing} />
-          <div className="mt-4"><Btn onClick={commit} disabled={busy}><FileDown size={16} /> Confirm, Save & Download PDF</Btn></div>
+          <p className="text-sm text-slate-600 mt-3">On confirm: {missing.length} missing device(s) are set to Yet-to-be-find, and {rows.filter((r) => r.Type === 'Transferred').length} transferred device(s) move to {loc}.</p>
+          <div className="mt-4"><Btn onClick={commit} disabled={busy}><FileDown size={16} /> Confirm, Save & Download PDF + CSV</Btn></div>
         </Modal>
       )}
 
       {done && (
         <Modal title={`Audit ${done.auditId} saved — ${done.site}`} onClose={() => setDone(null)}>
-          <AuditSummary items={done.items} missing={done.missing} />
-          <div className="mt-4"><Btn onClick={() => makePdf(done)}><FileDown size={16} /> Download PDF again</Btn></div>
+          <AuditSummary items={done.items} missing={done.missing} at={done.at} />
+          <div className="mt-4"><Btn onClick={() => exportAudit(done)}><FileDown size={16} /> Download PDF + CSV again</Btn></div>
         </Modal>
       )}
     </div>
   );
+}
+
+/* ---------- Audit Log (all users): every saved audit, and its missing / moved / new devices ---------- */
+function AuditLog({ audits }) {
+  const [q, setQ] = useState('');
+  const [kind, setKind] = useState('');
+  const [limit, setLimit] = useState(200);
+  const byDate = useMemo(() => [...audits].sort((a, b) => String(b.CompletedAt).localeCompare(String(a.CompletedAt))), [audits]);
+  const flags = useMemo(() => byDate.flatMap((a) => (a.Items || []).filter((i) => i.Type !== 'Reconciled').map((i) => ({
+    ...i, AuditID: a.AuditID, Site: a.Location, CompletedAt: a.CompletedAt,
+    Age: i.Type === 'Missing' && i.LastScanned ? Math.floor((new Date(a.CompletedAt) - new Date(i.LastScanned)) / 864e5) : '',
+  }))), [byDate]);
+  const rows = useMemo(() => flags.filter((r) => (!kind || r.Type === kind) && (!q || JSON.stringify(r).toLowerCase().includes(q.toLowerCase()))), [flags, kind, q]);
+  useEffect(() => setLimit(200), [q, kind]);
+  const th = 'p-3';
+  return (
+    <div className="space-y-4">
+      <Card className="overflow-x-auto">
+        <div className="p-4 font-semibold">Audits ({byDate.length})</div>
+        <table className="w-full text-sm">
+          <thead className="bg-slate-50 text-left text-xs uppercase text-slate-500">
+            <tr><th className={th}>Audit</th><th className={th}>Site</th><th className={th}>Auditor</th><th className={th}>Completed</th><th className={`${th} text-right`}>Scanned</th><th className={`${th} text-right`}>Reconciled</th><th className={`${th} text-right`}>New</th><th className={`${th} text-right`}>Transferred</th><th className={`${th} text-right`}>Missing</th></tr>
+          </thead>
+          <tbody>
+            {byDate.map((a) => {
+              const s = a.Summary || {};
+              return (
+                <tr key={a.AuditID} className="border-t">
+                  <td className="p-3 font-mono">{a.AuditID}</td><td className="p-3">{a.Location}</td><td className="p-3">{a.Auditor}</td><td className="p-3 text-slate-500 whitespace-nowrap">{fmt(a.CompletedAt)}</td>
+                  <td className="p-3 text-right">{s.total ?? '—'}</td><td className="p-3 text-right">{s.reconciled ?? '—'}</td><td className="p-3 text-right">{s.excess ?? '—'}</td><td className="p-3 text-right">{s.transferred ?? '—'}</td><td className="p-3 text-right">{s.missing ?? '—'}</td>
+                </tr>
+              );
+            })}
+            {!byDate.length && <tr><td colSpan={9} className="p-6 text-center text-slate-400">No audits yet</td></tr>}
+          </tbody>
+        </table>
+      </Card>
+
+      <Card className="overflow-x-auto">
+        <div className="p-4 flex flex-wrap gap-3 items-center">
+          <span className="font-semibold">Missing, moved and new devices</span>
+          <div className="relative flex-1 min-w-[200px]"><Search size={16} className="absolute left-3 top-2.5 text-slate-400" />
+            <Input className="pl-9" placeholder="Search serial, IMEI, site, auditor…" value={q} onChange={(e) => setQ(e.target.value)} /></div>
+          <Select value={kind} onChange={(e) => setKind(e.target.value)} aria-label="Result"><option value="">All results</option><option>Missing</option><option>Transferred</option><option>New</option></Select>
+          <span className="text-sm text-slate-500">{rows.length} rows</span>
+        </div>
+        <table className="w-full text-sm">
+          <thead className="bg-slate-50 text-left text-xs uppercase text-slate-500">
+            <tr><th className={th}>When</th><th className={th}>Audit</th><th className={th}>Site</th><th className={th}>Serial</th><th className={th}>IMEI</th><th className={th}>Make / Model</th><th className={th}>Result</th><th className={th}>Previous location</th><th className={th}>Last scanned</th><th className={th}>Age (days)</th></tr>
+          </thead>
+          <tbody>
+            {rows.slice(0, limit).map((r, i) => (
+              <tr key={`${r.AuditID}-${r.Serial}-${i}`} className="border-t">
+                <td className="p-3 text-slate-500 whitespace-nowrap">{fmt(r.CompletedAt)}</td><td className="p-3 font-mono">{r.AuditID}</td><td className="p-3">{r.Site}</td>
+                <td className="p-3 font-mono">{r.Serial}</td><td className="p-3 font-mono">{r.imei}</td><td className="p-3">{r.Make} {r.Model}</td>
+                <td className="p-3"><span className={`px-2 py-0.5 rounded-full text-xs font-medium ${TYPE_BADGE[r.Type]}`}>{r.Type}</span></td>
+                <td className="p-3">{r.From}</td><td className="p-3 text-slate-500 whitespace-nowrap">{r.LastScanned ? fmt(r.LastScanned) : ''}</td><td className="p-3">{r.Age}</td>
+              </tr>
+            ))}
+            {!rows.length && <tr><td colSpan={10} className="p-6 text-center text-slate-400">Nothing flagged</td></tr>}
+          </tbody>
+        </table>
+        {rows.length > limit && <div className="p-4 text-center"><Btn onClick={() => setLimit(limit + 500)}>Show more ({rows.length - limit} left)</Btn></div>}
+      </Card>
+    </div>
+  );
+}
+
+/* ---------- Master list CSV for one or more sites (in-transit devices included for sites they were sent from) ---------- */
+function saveMaster(devices, tickets, sites) {
+  const q = (v) => `"${String(v ?? '').replace(/"/g, '""')}"`;
+  const cols = ['Serial', 'IMEI', 'Make', 'Model', 'Status', 'Location', 'Last Updated', 'Last Audited'];
+  // in-transit devices keep no origin site, so take them from pending tickets sent from the selected sites
+  const leaving = new Set(tickets.filter((t) => sites.includes(t.SenderSite) && t.Status === 'Pending Receipt').flatMap(serialsOf));
+  const rows = devices.filter((d) => sites.includes(d.Location) || (inTransit(d) && leaving.has(d.Serial)))
+    .sort((a, b) => String(a.Location).localeCompare(String(b.Location)) || String(a.Serial).localeCompare(String(b.Serial)))
+    .map((d) => [d.Serial, d.imei_number || '', d.Make, d.Model, d.Status, d.Location, d.LastUpdated || '', d.LastAudited || '']);
+  const text = [cols, ...rows].map((r) => r.map(q).join(',')).join('\r\n');
+  const url = URL.createObjectURL(new Blob(['﻿' + text], { type: 'text/csv;charset=utf-8' })); // BOM so Excel reads UTF-8
+  const name = sites.length === 1 ? sites[0] : `${sites.length}-sites`;
+  const a = document.createElement('a');
+  a.href = url; a.download = `HHD-Master-${name}-${new Date().toISOString().slice(0, 10)}.csv`;
+  a.click(); URL.revokeObjectURL(url);
 }

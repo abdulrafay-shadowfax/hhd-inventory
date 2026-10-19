@@ -218,7 +218,7 @@ const ACTIONS = {
       need_(!d || d.Status !== 'In-Transit', s + ' is in transit; acknowledge its ticket first');
       return {
         Serial: s, Make: d ? d.Make : 'Unknown', Model: d ? d.Model : 'Unknown', Status: d ? d.Status : 'Working',
-        From: d && d.Location !== site ? d.Location : '',
+        From: d && d.Location !== site ? d.Location : '', imei: d ? (d.imei_number || '') : '',
         Type: !d ? 'New' : d.Location === site ? 'Reconciled' : 'Transferred',
       };
     });
@@ -235,10 +235,18 @@ const ACTIONS = {
 
     // missing = registered at this site (in-transit devices have a different Location string) but not scanned
     const seen = new Set(scanned);
-    const missing = api_('devices', 'GET', null, '?select=Serial,Make,Model,Status&Location=eq.' + encodeURIComponent(site)).filter(d => !seen.has(d.Serial));
+    const missing = api_('devices', 'GET', null, '?select=Serial,imei_number,Make,Model,Status,LastUpdated,LastAudited&Location=eq.' + encodeURIComponent(site)).filter(d => !seen.has(d.Serial));
     const auditor = u.name + ' (' + u.user + ')', id = 'AUD-' + Utilities.getUuid().slice(0, 8).toUpperCase();
+    // missing devices become Yet-to-be-find; logged like any other status change (log first)
+    const toFind = missing.filter(d => d.Status !== 'Yet-to-be-find');
+    if (toFind.length) {
+      api_('status_log', 'POST', toFind.map(d => ({ Serial: d.Serial, Location: site, OldStatus: d.Status, NewStatus: 'Yet-to-be-find', ChangedAt: now, ChangedBy: auditor })));
+      apiBatch_(patch(toFind.map(d => d.Serial), { Status: 'Yet-to-be-find', LastUpdated: now }));
+    }
+    // missing devices are stored in the audit too, so the Audit Log can list them
+    const missingItems = missing.map(m => ({ Serial: m.Serial, Make: m.Make, Model: m.Model, Status: m.Status, Type: 'Missing', From: '', imei: m.imei_number || '', LastScanned: m.LastAudited || m.LastUpdated || null }));
     api_('audits', 'POST', {
-      AuditID: id, Location: site, Auditor: auditor, CompletedAt: now, Items: items,
+      AuditID: id, Location: site, Auditor: auditor, CompletedAt: now, Items: [...items, ...missingItems],
       Summary: { total: items.length, reconciled: of('Reconciled').length, excess: of('New').length, transferred: of('Transferred').length, missing: missing.length },
     });
     return { auditId: id, site, auditor, at: now, items, missing };
@@ -310,9 +318,10 @@ function doGet(e) {
     const u = verify_(e.parameter.token);
     if (!u) return out_({ ok: false, error: 'auth' });
     return out_({
-      ok: true, version: '3.4', devices: api_('devices'), tickets: api_('tickets'),
+      ok: true, version: '3.5', devices: api_('devices'), tickets: api_('tickets'),
       users: users_(), sites: api_('sites').map(x => x.Site),
       // admins see every change, others only changes at sites they can access
+      audits: api_('audits', 'GET', null, '?select=AuditID,Location,Auditor,CompletedAt,Summary,Items&order=CompletedAt.desc&limit=500'),
       statusLog: api_('status_log', 'GET', null, '?order=ChangedAt.desc&limit=1000').filter(l => siteOk_(u, l.Location)),
     });
   } catch (err) { return out_({ ok: false, error: String(err.message || err) }); }
