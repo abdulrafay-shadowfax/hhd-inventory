@@ -58,7 +58,7 @@ function toDevices(rows, existing = []) {
 // @csv-end
 
 // Backend URL: baked in at build time (Vercel env var VITE_API_URL). Admins may override it in the Config tab.
-const DEFAULT_URL = 'https://script.google.com/macros/s/AKfycbzeqc5TBgEAiBVWxIeSc81Oi60APZ0KaF7KMSGmbbVMerU08a2BWASAvw0lZqia71Ph/exec';
+const DEFAULT_URL = 'https://script.google.com/macros/s/AKfycbzZDCeSSrNqzzpaB_FYrfaUICJ9T01gDiGOWOm6zlQwPGs19nlFq6hVb8jJhbfUCTsq/exec';
 const ACTIONS = ['Inter-Site Transfer', 'Handover to Service Support', 'Replacement Return from Service Support'];
 const BADGE = {
   Working: 'bg-green-100 text-green-800',
@@ -582,7 +582,7 @@ function Dispatch({ site, sites, me, users, devices, push, busy, flash }) {
         <Modal title={`${pick.length} devices share this IMEI: choose which to add`} onClose={() => setPick(null)}>
           <table className="w-full text-sm">
             <thead className="text-left text-xs uppercase text-slate-500">
-              <tr><th className="p-2 w-8" /><th className="p-2">Serial</th><th className="p-2">IMEI</th><th className="p-2">Make / Model</th><th className="p-2">Status</th><th className="p-2">Location</th></tr>
+              <tr><th className="p-2 w-8" /><th className="p-2">Serial</th><th className="p-2">IMEI/Device S.No</th><th className="p-2">Make / Model</th><th className="p-2">Status</th><th className="p-2">Location</th></tr>
             </thead>
             <tbody>
               {pick.map((d) => {
@@ -660,7 +660,7 @@ function DeviceTable({ devices, me, push, busy, flash }) {
         <thead className="bg-slate-50 text-left text-xs uppercase text-slate-500">
           <tr>
             <th className="p-3 w-8"><input type="checkbox" checked={allSel} onChange={toggleAll} disabled={!editable.length} aria-label="Select all" /></th>
-            <th className="p-3">Serial</th><th className="p-3">IMEI</th><th className="p-3">Make</th><th className="p-3">Model</th><th className="p-3">Status</th><th className="p-3">Location</th><th className="p-3">Last Updated</th>
+            <th className="p-3">Serial</th><th className="p-3">IMEI/Device S.No</th><th className="p-3">Make</th><th className="p-3">Model</th><th className="p-3">Status</th><th className="p-3">Location</th><th className="p-3">Last Updated</th>
           </tr>
         </thead>
         <tbody>
@@ -701,7 +701,7 @@ function StatusLog({ log, devices }) {
         <Input className="pl-9" placeholder="Search by serial, IMEI, user, site, status…" value={q} onChange={(e) => setQ(e.target.value)} /></div>
       <table className="w-full text-sm">
         <thead className="bg-slate-50 text-left text-xs uppercase text-slate-500">
-          <tr><th className="p-3">When</th><th className="p-3">Device</th><th className="p-3">IMEI</th><th className="p-3">Site</th><th className="p-3">Old status</th><th className="p-3">New status</th><th className="p-3">Changed by</th></tr>
+          <tr><th className="p-3">When</th><th className="p-3">Device</th><th className="p-3">IMEI/Device S.No</th><th className="p-3">Site</th><th className="p-3">Old status</th><th className="p-3">New status</th><th className="p-3">Changed by</th></tr>
         </thead>
         <tbody>
           {rows.slice(0, limit).map((l, i) => (
@@ -950,7 +950,7 @@ function auditRows({ items, missing, at }) {
     ...missing.map((m) => ({ Result: 'Missing', Serial: m.Serial, IMEI: m.imei_number || '', Make: m.Make, Model: m.Model, Previous: '', LastScanned: lastSeen(m), Age: ageDays(m, at) })),
   ];
 }
-const COLS = ['#', 'Result', 'Serial', 'IMEI', 'Make', 'Model', 'Previous location', 'Last scanned', 'Age (days)'];
+const COLS = ['#', 'Result', 'Serial', 'IMEI/Device S.No', 'Make', 'Model', 'Previous location', 'Last scanned', 'Age (days)'];
 const cells = (r, k) => [k + 1, r.Result, r.Serial, r.IMEI, r.Make, r.Model, r.Previous, r.LastScanned ? fmt(r.LastScanned) : '', r.Age];
 
 async function makePdf(j) {
@@ -1018,6 +1018,7 @@ function DeviceAudit({ sites, devices, push, busy }) {
   const [review, setReview] = useState(false);
   const [done, setDone] = useState(null);
   const inp = useRef(null);
+  const timer = useRef(null); // auto-submit timer for scanned codes
   const byS = useMemo(() => Object.fromEntries(devices.map((d) => [d.Serial, d])), [devices]);
   const byImei = useMemo(() => {
     const m = {};
@@ -1027,8 +1028,9 @@ function DeviceAudit({ sites, devices, push, busy }) {
   const focus = () => setTimeout(() => inp.current?.focus(), 0);
   useEffect(() => { setRows([]); setNote(''); if (loc) focus(); }, [loc]);
 
-  const add = () => {
-    const s = scan.trim().toUpperCase();
+  const add = (raw = scan) => {
+    clearTimeout(timer.current);
+    const s = String(raw).trim().toUpperCase();
     setScan(''); setNote(''); focus();
     if (!s) return;
     // a serial match always wins over an IMEI match
@@ -1042,6 +1044,13 @@ function DeviceAudit({ sites, devices, push, busy }) {
     if (inTransit(d)) return setNote(`${d.Serial}: in transit, acknowledge its ticket first`);
     if (d.Location !== loc) return setWarn(d);
     setRows((r) => [{ Serial: d.Serial, imei: d.imei_number, Type: 'Reconciled', Make: d.Make, Model: d.Model }, ...r]);
+  };
+  // a known serial/IMEI submits itself shortly after the last character, so scanners need no Enter.
+  // Unknown codes still wait for Enter. Enter still works and cancels the timer.
+  const onScan = (v) => {
+    setScan(v); clearTimeout(timer.current);
+    const k = v.trim().toUpperCase();
+    if (k && (byS[k] || byImei[k])) timer.current = setTimeout(() => add(v), 250);
   };
   const reassign = () => {
     setRows((r) => [{ Serial: warn.Serial, imei: warn.imei_number, Type: 'Transferred', From: warn.Location, Make: warn.Make, Model: warn.Model }, ...r]);
@@ -1068,10 +1077,10 @@ function DeviceAudit({ sites, devices, push, busy }) {
           <option value="">Select audit location…</option>{sites.map((s) => <option key={s}>{s}</option>)}
         </Select>
         <div className="flex gap-2">
-          <input ref={inp} disabled={!loc || !!warn} value={scan} onChange={(e) => setScan(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && add()}
+          <input ref={inp} disabled={!loc || !!warn} value={scan} onChange={(e) => onScan(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && add()}
             placeholder={loc ? 'Scan serial or IMEI, press Enter' : 'Pick a location first'}
             className="border border-slate-300 rounded-lg px-3 py-2 text-sm w-full focus:outline-none focus:ring-2 focus:ring-indigo-400 disabled:bg-slate-100" />
-          <Btn onClick={add} disabled={!loc || !scan.trim()}>Add</Btn>
+          <Btn onClick={() => add()} disabled={!loc || !scan.trim()}>Add</Btn>
         </div>
         {note && <div className="text-sm text-red-700 bg-red-50 rounded-lg p-2 flex gap-2"><AlertTriangle size={16} className="shrink-0 mt-0.5" />{note}</div>}
       </Card>
@@ -1085,7 +1094,10 @@ function DeviceAudit({ sites, devices, push, busy }) {
           {rows.map((r) => (
             <div key={r.Serial} className={`py-2 px-1 text-sm flex justify-between ${r.Type === 'Transferred' ? 'bg-red-50' : ''}`}>
               <span><span className="font-mono">{r.Serial}</span> <span className="text-slate-500">{r.Make} {r.Model}{r.imei && ` · IMEI ${r.imei}`}{r.From && ` · from ${r.From}`}</span></span>
-              <span className={`px-2 py-0.5 rounded-full text-xs font-medium ${TYPE_BADGE[r.Type]}`}>{r.Type}</span>
+              <span className="flex items-center gap-2">
+                <span className={`px-2 py-0.5 rounded-full text-xs font-medium ${TYPE_BADGE[r.Type]}`}>{r.Type}</span>
+                <button onClick={() => setRows((x) => x.filter((y) => y.Serial !== r.Serial))} aria-label={`Remove ${r.Serial}`} className="text-red-500"><Trash2 size={16} /></button>
+              </span>
             </div>
           ))}
           {!rows.length && <div className="py-8 text-center text-slate-400">Nothing scanned yet.</div>}
@@ -1169,7 +1181,7 @@ function AuditLog({ audits }) {
         </div>
         <table className="w-full text-sm">
           <thead className="bg-slate-50 text-left text-xs uppercase text-slate-500">
-            <tr><th className={th}>When</th><th className={th}>Audit</th><th className={th}>Site</th><th className={th}>Serial</th><th className={th}>IMEI</th><th className={th}>Make / Model</th><th className={th}>Result</th><th className={th}>Previous location</th><th className={th}>Last scanned</th><th className={th}>Age (days)</th></tr>
+            <tr><th className={th}>When</th><th className={th}>Audit</th><th className={th}>Site</th><th className={th}>Serial</th><th className={th}>IMEI/Device S.No</th><th className={th}>Make / Model</th><th className={th}>Result</th><th className={th}>Previous location</th><th className={th}>Last scanned</th><th className={th}>Age (days)</th></tr>
           </thead>
           <tbody>
             {rows.slice(0, limit).map((r, i) => (
@@ -1192,7 +1204,7 @@ function AuditLog({ audits }) {
 /* ---------- Master list CSV for one or more sites (in-transit devices included for sites they were sent from) ---------- */
 function saveMaster(devices, tickets, sites) {
   const q = (v) => `"${String(v ?? '').replace(/"/g, '""')}"`;
-  const cols = ['Serial', 'IMEI', 'Make', 'Model', 'Status', 'Location', 'Last Updated', 'Last Audited'];
+  const cols = ['Serial', 'IMEI/Device S.No', 'Make', 'Model', 'Status', 'Location', 'Last Updated', 'Last Audited'];
   // in-transit devices keep no origin site, so take them from pending tickets sent from the selected sites
   const leaving = new Set(tickets.filter((t) => sites.includes(t.SenderSite) && t.Status === 'Pending Receipt').flatMap(serialsOf));
   const rows = devices.filter((d) => sites.includes(d.Location) || (inTransit(d) && leaving.has(d.Serial)))

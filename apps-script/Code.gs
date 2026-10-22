@@ -243,6 +243,12 @@ const ACTIONS = {
       api_('status_log', 'POST', toFind.map(d => ({ Serial: d.Serial, Location: site, OldStatus: d.Status, NewStatus: 'Yet-to-be-find', ChangedAt: now, ChangedBy: auditor })));
       apiBatch_(patch(toFind.map(d => d.Serial), { Status: 'Yet-to-be-find', LastUpdated: now }));
     }
+    // scanned devices that were Yet-to-be-find are back in hand: set them to Working (logged)
+    const found = items.filter(i => i.Status === 'Yet-to-be-find' && (i.Type === 'Reconciled' || i.Type === 'Transferred'));
+    if (found.length) {
+      api_('status_log', 'POST', found.map(i => ({ Serial: i.Serial, Location: site, OldStatus: 'Yet-to-be-find', NewStatus: 'Working', ChangedAt: now, ChangedBy: auditor })));
+      apiBatch_(patch(found.map(i => i.Serial), { Status: 'Working', LastUpdated: now }));
+    }
     // missing devices are stored in the audit too, so the Audit Log can list them
     const missingItems = missing.map(m => ({ Serial: m.Serial, Make: m.Make, Model: m.Model, Status: m.Status, Type: 'Missing', From: '', imei: m.imei_number || '', LastScanned: m.LastAudited || m.LastUpdated || null }));
     api_('audits', 'POST', {
